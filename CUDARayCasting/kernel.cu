@@ -11,6 +11,10 @@
 #include <opencv2/imgproc/imgproc.hpp>
 #include <opencv2/highgui/highgui.hpp>
 
+#define MAX_INTERSECTIONS 3
+#define MAX_DISTANCE 1000
+#define EPSILON 0.0001
+
 struct sphere
 {
 	//Origen
@@ -25,6 +29,7 @@ struct sphere
 	uchar b;
 	float difrac;
 	float refrac;
+	float IOR;
 };
 
 struct ray
@@ -102,11 +107,18 @@ __device__ bool sphereIntersection(ray* ray_test, sphere* obj, float* dist)
 
 }
 
-__device__ vector3 phongShading(light* luzes, int num_luzes, vector3* point, vector3* normal, vector3* camera, vector3* color)
-{
-	//Factores de Phong
-	float ambiental = 0.2;
-	float difuso = 0.5;
+__device__ vector3 reflect(vector3& v, vector3& n) {
+	vector3 ResultVec;
+	ResultVec.x = v.x - 2.0f * dotP(v, n) * n.x;
+	ResultVec.y = v.y - 2.0f * dotP(v, n) * n.y;
+	ResultVec.z = v.z - 2.0f * dotP(v, n) * n.z;
+	return ResultVec;
+}
+
+__device__ vector3 phongShading1light(light* luz, vector3* point, vector3* normal, vector3* dir_camera, vector3* color) {
+	//Factores de phong
+	float ambiental = 0.9f;
+	float difuso = 0.3f;
 	float specular = 0.3f;
 	float brillantez = 100;
 
@@ -115,9 +127,66 @@ __device__ vector3 phongShading(light* luzes, int num_luzes, vector3* point, vec
 	colorSalida.y = 0;
 	colorSalida.z = 0;
 
+	//calcular ambiental
+	colorSalida.x += color->x * ambiental;
+	colorSalida.y += color->y * ambiental;
+	colorSalida.z += color->z * ambiental;
+
+	//Calcular difusa
+	vector3 luz_vect;
+	luz_vect.x = luz->x - point->x;
+	luz_vect.y = luz->y - point->y;
+	luz_vect.z = luz->z - point->z;
+
+	normalize(&luz_vect);
+
+	float dot_difuso = luz_vect.x * normal->x + luz_vect.y * normal->y + luz_vect.z * normal->z;
+	if (dot_difuso > 0)
+	{
+		colorSalida.x += dot_difuso * color->x * difuso;
+		colorSalida.y += dot_difuso * color->y * difuso;
+		colorSalida.z += dot_difuso * color->z * difuso;
+		//dot_difuso *= difuso;
+		//Calcular especular
+		vector3 rVect;
+		rVect.x = luz_vect.x - 2.0f * (dot_difuso)*normal->x;
+		rVect.y = luz_vect.y - 2.0f * (dot_difuso)*normal->y;
+		rVect.z = luz_vect.z - 2.0f * (dot_difuso)*normal->z;
+
+		//Necesitamos vector que va a la camara. Calculamos el vector que va a la camara.
+		float dotVR = rVect.x * dir_camera->x + rVect.y * dir_camera->y + rVect.z * dir_camera->z;
+		dotVR - powf(dotVR, brillantez); //Factor especular
+
+		colorSalida.x += dotVR * color->x * specular;
+		colorSalida.y += dotVR * color->y * specular;
+		colorSalida.z += dotVR * color->z * specular;
+
+	}
+
+
+	colorSalida.x = min(255, (int)roundf(colorSalida.x));
+	colorSalida.y = min(255, (int)roundf(colorSalida.y));
+	colorSalida.z = min(255, (int)roundf(colorSalida.z));
+
+	return colorSalida;
+}
+
+__device__ vector3 phongShading(light* lights, int num_lights, vector3* point, vector3* normal, vector3* camera, vector3* color)
+{
+	//Factores de Phong
+	float ambiental = 0.2;
+	float difuso = 0.5;
+	float specular = 0.2f;
+	float brillantez = 20;
+
+	vector3 colorSalida;
+	colorSalida.x = 0;
+	colorSalida.y = 0;
+	colorSalida.z = 0;
+
 	// Calcular la contribución de cada luz
-	for (int i = 0; i < num_luzes; ++i) {
-		light luz = luzes[i];
+	for (int i = 0; i < num_lights; ++i) {
+		light luz = lights[i];
 
 		// Calcular componente ambiental
 		colorSalida.x += color->x * ambiental * luz.intensity;
@@ -170,8 +239,19 @@ __device__ vector3 phongShading(light* luzes, int num_luzes, vector3* point, vec
 	return colorSalida;
 }
 
+__device__ vector3 refract(vector3& incident, vector3& normal, float n1, float n2) {
+	float n = n1 / n2;
+	float cosI = -dotP(incident, normal);
+	float sinT2 = n * n * (1.0f - cosI * cosI);
+	if (sinT2 > 1.0f)
+		return vector3{ 0.0f, 0.0f, 0.0f }; // Total internal reflection
+	float cosT = sqrtf(1.0f - sinT2);
+	return vector3{ n * incident.x + (n * cosI - cosT) * normal.x,
+					n * incident.y + (n * cosI - cosT) * normal.y,
+					n * incident.z + (n * cosI - cosT) * normal.z };
+}
 
-__global__ void rayCasting(vector3* camera, light* luz, vector3* pi_corner, uchar* output, sphere* objects, int num_esferas, int num_luz, int width, int heigth, float inc_x, float inc_y)
+__global__ void rayCastingMultipleIntersections(vector3* camera, light* luz, vector3* pi_corner, uchar* output, sphere* objects, int num_esferas, int num_luz, int width, int heigth, float inc_x, float inc_y)
 {
 	//columna
 	int i = blockDim.x * blockIdx.x + threadIdx.x;
@@ -180,95 +260,127 @@ __global__ void rayCasting(vector3* camera, light* luz, vector3* pi_corner, ucha
 
 	if (i < width && j < heigth)
 	{
+		//int idx = i * width * 3 + j * 3;
 		int idx = j * width * 3 + i * 3;
 
 		ray primary;
-		// Origen de rayos
-		primary.x = camera->x;
-		primary.y = camera->y;
-		primary.z = camera->z;
-
-		// Ver la esquina izquierda de cada pixel para cada thread
 		vector3 dest;
 		dest.x = pi_corner->x + inc_x * i;
 		dest.y = pi_corner->y - inc_y * j;
 		dest.z = 1;
 
-		// Rayo vector de dirección sin normalizar
+		primary.x = camera->x;
+		primary.y = camera->y;
+		primary.z = camera->z;
+
 		primary.d_x = dest.x - primary.x;
 		primary.d_y = dest.y - primary.y;
 		primary.d_z = dest.z - primary.z;
-		// Normalizar rayos
+
 		float aux = sqrtf(primary.d_x * primary.d_x + primary.d_y * primary.d_y + primary.d_z * primary.d_z);
 		primary.d_x /= aux;
 		primary.d_y /= aux;
 		primary.d_z /= aux;
 
-		//llenamos de un color
-		float distance = 0; // Distancia para ver donde esta el choque. 
-		//Foxu 3 spheres
-		float min_dist = 1000;
+		// Variables para la iteración
 		vector3 hit_point;
-		sphere hit_sphere;
-		bool intersected = false; //Si choco con algo es el interPoint
-		//Foxu 3 spheres
-		// Iterar sobre todas las esferas para encontrar la más cercana
-		for (int k = 0; k < num_esferas; k++) {
-			if (sphereIntersection(&primary, &objects[k], &distance)) {
-				intersected = true;
-				if (distance < min_dist) {
-					min_dist = distance;
-					hit_point.x = primary.d_x * distance + primary.x;
-					hit_point.y = primary.d_y * distance + primary.y;
-					hit_point.z = primary.d_z * distance + primary.z;
-					hit_sphere = objects[k]; //Con que esfera choque. 
+		vector3 normal;
+		vector3 color;
+		vector3 cameraVect;
+		bool intersected;
+		bool refraction = false; //Bandera de que atravese una esfera y debo agarrar el color del fondo
+		float min_dist;
+
+		for (int iter = 0; iter < MAX_INTERSECTIONS; iter++) { //Iterar para hacer 3 rebotes
+			intersected = false;
+			min_dist = MAX_DISTANCE;
+
+			// Iterar sobre todas las esferas para encontrar la más cercana
+			for (int k = 0; k < num_esferas; k++)
+			{
+				float distance;
+				if (sphereIntersection(&primary, &objects[k], &distance)) {
+					intersected = true;
+					if (distance < min_dist) {
+
+						min_dist = distance;
+						hit_point.x = primary.d_x * distance + primary.x;
+						hit_point.y = primary.d_y * distance + primary.y;
+						hit_point.z = primary.d_z * distance + primary.z;
+						normal.x = hit_point.x - objects[k].x;
+						normal.y = hit_point.y - objects[k].y;
+						normal.z = hit_point.z - objects[k].z;
+						//normal.x = -hit_point.x + objects[k].x;//Sombra
+						//normal.y = -hit_point.y + objects[k].y;
+						//normal.z = -hit_point.z + objects[k].z;
+						normalize(&normal);
+						if (objects[k].refrac > 0.0f) { // Check if the material is transparent
+							float n1 = 1.0f; // Air refractive index
+							float n2 = objects[k].IOR; // Material's refractive index
+							refraction = true;
+							//color.x = 255;
+							//color.y = 255;
+							//color.z = 255;
+							vector3 refracted = refract({ primary.d_x,primary.d_y,primary.d_z }, normal, n1, n2);
+							if (refracted.x != 0.0f && refracted.y != 0.0f && refracted.z != 0.0f) { // Not total internal reflection
+								primary.d_x = refracted.x;
+								primary.d_y = refracted.y;
+								primary.d_z = refracted.z;
+								// Move the hit point slightly along the normal to avoid self-intersection
+								hit_point.x += EPSILON * normal.x;
+								hit_point.y += EPSILON * normal.y;
+								hit_point.z += EPSILON * normal.z;
+								continue; // Continue tracing the refracted ray
+							}
+							
+						}
+
+						color.x = objects[k].r;
+						color.y = objects[k].g;
+						color.z = objects[k].b;
+
+					}
 				}
 			}
-		}
 
-		if (intersected) {
-			// Calcular vector normal de la intersección del rayo con la esfera.
-			vector3 normal;
-			normal.x = hit_point.x - hit_sphere.x;
-			normal.y = hit_point.y - hit_sphere.y;
-			normal.z = hit_point.z - hit_sphere.z;
-			// Normalizar el vector
-			normalize(&normal);
+			if (!intersected) {
+				// No hay intersección, asignamos un color de fondo y salimos del bucle
+				output[idx] = 30;
+				output[idx + 1] = 30;
+				output[idx + 2] = 30;
+				break;
+			}
 
-			// Color de la esferas
-			vector3 colorInicio;
-			colorInicio.x = hit_sphere.r;
-			colorInicio.y = hit_sphere.g;
-			colorInicio.z = hit_sphere.b;
-
-			vector3 cameraVect;
+			// Calcular el vector de la cámara para el regreso
 			cameraVect.x = camera->x - hit_point.x;
 			cameraVect.y = camera->y - hit_point.y;
 			cameraVect.z = camera->z - hit_point.z;
-
 			normalize(&cameraVect);
 
-			colorInicio = phongShading(luz, num_luz, &hit_point, &normal, &cameraVect, &colorInicio);
-			//Generamos el reflect
-			//Vemos si reflect choca con algo
-			// Si choca le pasamos colorInicio y le ajustamos el color.
-			// Si no choca le ponemos directo colorInicio.
-			//
 
-			output[idx] = colorInicio.z; // Blue
-			output[idx + 1] = colorInicio.y; // Green
-			output[idx + 2] = colorInicio.x; // Red
-		}
-		else {
-			output[idx] = 30;
-			output[idx + 1] = 30;
-			output[idx + 2] = 30;
-		}
+			// Calcular el color utilizando el modelo de iluminación de Phong
+			color = phongShading(luz, num_luz, &hit_point, &normal, &cameraVect, &color);
 
+			// Asignar el color al píxel
+			output[idx] = color.z; // B
+			output[idx + 1] = color.y; // G
+			output[idx + 2] = color.x; // R
+
+			// Calcular el nuevo rayo reflejado
+			primary.x = hit_point.x;
+			primary.y = hit_point.y;
+			primary.z = hit_point.z;
+			//primary.d_x = primary.x;
+			//primary.d_y = primary.y;
+			//primary.d_z = primary.z;
+			//Reflect
+			float dot_product = primary.x * normal.x + primary.y * normal.y + primary.z * normal.z;
+			primary.d_x -= hit_point.x - 2.0f * dot_product * normal.x;
+			primary.d_y -= hit_point.y - 2.0f * dot_product * normal.y;
+			primary.d_z -= hit_point.z - 2.0f * dot_product * normal.z;
+		}
 	}
-
 }
-
 
 int main()
 {
@@ -279,50 +391,56 @@ int main()
 	camera.z = 0;
 
 	//Tamano de imagen en pixeles y tamano de plano
-	int width = 500, height = 500;
+	int width = 800, height = 800;
 	float tam_imgX = 2, tam_imgY = 2;
 
 	int num_esferas = 3;
 	sphere esferas_host[3];
 	//Morada
 	esferas_host[0].x = 0;
-	esferas_host[0].y = 0;
-	esferas_host[0].z = 20;
+	esferas_host[0].y = 5;
+	esferas_host[0].z = 14;
 	esferas_host[0].r = 255;
 	esferas_host[0].g = 0;
 	esferas_host[0].b = 158;
 	esferas_host[0].radio = 2;
+	esferas_host[0].refrac = 0.0f;
+	esferas_host[0].IOR = 1.5f;
 	//Verde claro
-	esferas_host[1].x = 0;
-	esferas_host[1].y = -5;
-	esferas_host[1].z = 10;
+	esferas_host[1].x = 5;
+	esferas_host[1].y = 0;
+	esferas_host[1].z = 8;
 	esferas_host[1].r = 50;
 	esferas_host[1].g = 168;
 	esferas_host[1].b = 123;
 	esferas_host[1].radio = 2;
+	esferas_host[1].refrac = 0.5f;
+	esferas_host[1].IOR = 1.5f;
 	//Naranja
-	esferas_host[2].x = 0;
-	esferas_host[2].y = 5;
-	esferas_host[2].z = 10;
+	esferas_host[2].x = -5;
+	esferas_host[2].y = 0;
+	esferas_host[2].z = 8;
 	esferas_host[2].r = 200;
 	esferas_host[2].g = 100;
 	esferas_host[2].b = 50;
 	esferas_host[2].radio = 2;
+	esferas_host[2].refrac = 0.0f;
+	esferas_host[2].IOR = 1.5f;
 	//////////////////////
 
 	//Creamos una luz en el mundo
 	int num_luz = 3;
 	light light_host[2];
-	light_host[0].x = 25;
-	light_host[0].y = 3;
-	light_host[0].z = 1;
+	light_host[0].x = 0;
+	light_host[0].y = -4;
+	light_host[0].z = 12;
 	light_host[0].radio = 1;
-	light_host[0].intensity = 0.5;
-	light_host[1].x = 10;
-	light_host[1].y = 3;
-	light_host[1].z = -1;
+	light_host[0].intensity = 1;
+	light_host[1].x = 0;
+	light_host[1].y = 5;
+	light_host[1].z = 14;
 	light_host[1].radio = 1;
-	light_host[1].intensity = 1;
+	light_host[1].intensity = 0.5;
 	//light luz1;
 	//luz1.x = 25;
 	//luz1.y = 3;
@@ -381,7 +499,8 @@ int main()
 	/*cudaMemcpy(luz_dev, &luz1, sizeof(light), cudaMemcpyHostToDevice);
 	cudaMemcpy(luz_dev2, &luz2, sizeof(light), cudaMemcpyHostToDevice);*/
 	cudaMemcpy(lights_dev, light_host, 2 * sizeof(light), cudaMemcpyHostToDevice);
-	rayCasting << <blocks, threads >> > (camera_dev, lights_dev, esquina_dev, img_dev, esferas_dev, num_esferas, num_luz, width, height, inc_x, inc_y);
+	//rayCasting << <blocks, threads >> > (camera_dev, lights_dev, esquina_dev, img_dev, esferas_dev, num_esferas, num_luz, width, height, inc_x, inc_y);
+	rayCastingMultipleIntersections << <blocks, threads >> > (camera_dev, lights_dev, esquina_dev, img_dev, esferas_dev, num_esferas, num_luz, width, height, inc_x, inc_y);
 
 	cv::Mat frame = cv::Mat(cv::Size(width, height), CV_8UC3);
 	cudaMemcpy(frame.ptr(), img_dev, width * height * 3, cudaMemcpyDeviceToHost);
